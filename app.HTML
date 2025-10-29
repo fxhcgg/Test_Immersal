@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport"
+      content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no" />
+<title>点云查看器 + 相机背景</title>
+
+<style>
+  html, body {
+    margin: 0;
+    background: #000;
+    overflow: hidden;
+    touch-action: none;
+  }
+
+  /* 相机画面全屏铺底 */
+  #cam {
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: 100vw;
+    height: 100vh;
+    object-fit: cover;
+    background: #000;
+    z-index: 0;
+    /* iOS 需要这个避免全屏播放进入原生播放器 */
+  }
+
+  /* Three.js canvas 覆盖在视频上方 */
+  #glCanvas {
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: 100vw;
+    height: 100vh;
+    z-index: 1;
+    pointer-events: none; /* 触控交互我们直接监听这个元素本身仍可行,
+                             但为安全可以设成 none 让浏览器别拦手势 */
+  }
+</style>
+</head>
+<body>
+
+<!-- 摄像头预览 -->
+<video id="cam" autoplay playsinline muted></video>
+
+<!-- Three.js 渲染层 -->
+<canvas id="glCanvas"></canvas>
+
+<!-- Three.js -->
+<script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
+
+<script>
+(function() {
+  // ====== 打开后置摄像头 ======
+  const camVideo = document.getElementById("cam");
+  // iOS 要求必须在用户手势后才能开相机，但很多时候直接尝试也可以弹权限框
+  navigator.mediaDevices.getUserMedia({
+    video: {
+      facingMode: { ideal: "environment" } // 尽量用后置摄像头
+    },
+    audio: false
+  }).then(stream => {
+    camVideo.srcObject = stream;
+  }).catch(err => {
+    console.warn("相机开启失败:", err);
+    // 如果失败，背景就保持黑色，点云仍会显示
+  });
+
+  // ====== Three.js 基础场景/相机/渲染器 ======
+  const canvas = document.getElementById("glCanvas");
+
+  const scene = new THREE.Scene();
+  scene.background = null; // 透明，用来叠加在视频上方
+
+  const camera = new THREE.PerspectiveCamera(
+    60,
+    window.innerWidth / window.innerHeight,
+    0.01,
+    2000
+  );
+
+  // 相机围绕目标点的球坐标参数
+  const lookTarget = new THREE.Vector3(0,0,0);
+  let camDist = 5;
+  let camRotX = 0;
+  let camRotY = 0;
+
+  function updateCamera() {
+    const cosX = Math.cos(camRotX), sinX = Math.sin(camRotX);
+    const cosY = Math.cos(camRotY), sinY = Math.sin(camRotY);
+
+    const x = lookTarget.x + camDist * cosX * sinY;
+    const y = lookTarget.y + camDist * sinX;
+    const z = lookTarget.z + camDist * cosX * cosY;
+
+    camera.position.set(x,y,z);
+    camera.lookAt(lookTarget);
+    camera.updateProjectionMatrix();
+  }
+  updateCamera();
+
+  const renderer = new THREE.WebGLRenderer({
+    canvas: canvas,
+    antialias: true,
+    alpha: true   // alpha: true -> 允许透明, 让视频背景透出来
+  });
+  renderer.setPixelRatio(window.devicePixelRatio || 1);
+  renderer.setSize(window.innerWidth, window.innerHeight, false);
+
+  // 坐标轴（红X/绿Y/蓝Z），帮你确认方向
+  const axesHelper = new THREE.AxesHelper(0.5);
+  scene.add(axesHelper);
+
+  // ====== 触控交互：单指旋转 / 双指缩放 ======
+  let lastX = null;
+  let lastY = null;
+  let lastPinchDist = null;
+
+  function dist2(t1, t2) {
+    const dx = t1.clientX - t2.clientX;
+    const dy = t1.clientY - t2.clientY;
+    return Math.sqrt(dx*dx + dy*dy);
+  }
+
+  function onTouchStart(e) {
+    if (e.touches.length === 1) {
+      lastX = e.touches[0].clientX;
+      lastY = e.touches[0].clientY;
+    } else if (e.touches.length === 2) {
+      lastPinchDist = dist2(e.touches[0], e.touches[1]);
+    }
+  }
+
+  function onTouchMove(e) {
+    e.preventDefault();
+
+    // 单指旋转
+    if (e.touches.length === 1 && lastX !== null && lastY !== null) {
+      const dx = e.touches[0].clientX - lastX;
+      const dy = e.touches[0].clientY - lastY;
+      lastX = e.touches[0].clientX;
+      lastY = e.touches[0].clientY;
+
+      camRotY -= dx * 0.005;
+      camRotX -= dy * 0.005;
+
+      const maxPitch = Math.PI/2 - 0.1;
+      if (camRotX >  maxPitch) camRotX =  maxPitch;
+      if (camRotX < -maxPitch) camRotX = -maxPitch;
+
+      updateCamera();
+    }
+
+    // 双指缩放
+    if (e.touches.length === 2) {
+      const d = dist2(e.touches[0], e.touches[1]);
+      if (lastPinchDist != null) {
+        const delta = d - lastPinchDist;
+        camDist -= delta * 0.01;
+        if (camDist < 0.2) camDist = 0.2;
+        if (camDist > 200) camDist = 200;
+        updateCamera();
+      }
+      lastPinchDist = d;
+    }
+  }
+
+  function onTouchEnd(e) {
+    if (e.touches.length === 0) {
+      lastX = null;
+      lastY = null;
+      lastPinchDist = null;
+    }
+  }
+
+  // 我们监听整个窗口的触摸，而不是canvas的 pointer-events
+  window.addEventListener("touchstart", onTouchStart, {passive:false});
+  window.addEventListener("touchmove",  onTouchMove,  {passive:false});
+  window.addEventListener("touchend",   onTouchEnd,   {passive:false});
+  window.addEventListener("touchcancel",onTouchEnd,   {passive:false});
+
+  // ====== 自动把相机距离调到包住点云 ======
+  function fitCameraToPoints(points) {
+    if (!points.length) return;
+    let minX=Infinity,minY=Infinity,minZ=Infinity;
+    let maxX=-Infinity,maxY=-Infinity,maxZ=-Infinity;
+
+    for (let i=0;i<points.length;i++) {
+      const x = points[i][0];
+      const y = points[i][1];
+      const z = points[i][2];
+      if (x<minX) minX=x;
+      if (y<minY) minY=y;
+      if (z<minZ) minZ=z;
+      if (x>maxX) maxX=x;
+      if (y>maxY) maxY=y;
+      if (z>maxZ) maxZ=z;
+    }
+
+    lookTarget.set(
+      (minX+maxX)/2,
+      (minY+maxY)/2,
+      (minZ+maxZ)/2
+    );
+
+    const span = Math.max(maxX-minX, maxY-minY, maxZ-minZ);
+    camDist = span * 1.5 + 1.0;
+    if (camDist < 0.5) camDist = 0.5;
+    if (camDist > 200) camDist = 200;
+
+    camRotX = 0;
+    camRotY = 0;
+    updateCamera();
+  }
+
+  // ====== 把点云放到场景里 ======
+  function showPointCloud(points) {
+    if (!points || !points.length) return;
+
+    const arr = new Float32Array(points.length * 3);
+    for (let i=0; i<points.length; i++) {
+      arr[i*3+0] = points[i][0];
+      arr[i*3+1] = points[i][1];
+      arr[i*3+2] = points[i][2];
+    }
+
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute("position", new THREE.BufferAttribute(arr,3));
+
+    // 绿点
+    const mat = new THREE.PointsMaterial({
+      color: 0x00ff00,
+      size: 0.03,
+      sizeAttenuation: true
+    });
+
+    const cloud = new THREE.Points(geom, mat);
+    scene.add(cloud);
+
+    fitCameraToPoints(points);
+  }
+
+  // ====== 解析 binary_little_endian PLY (你的格式) ======
+  async function loadBinaryPLY(url) {
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      console.error("加载 sparse.ply 失败 HTTP", resp.status);
+      return [];
+    }
+
+    const buffer = await resp.arrayBuffer();
+    const bytes  = new Uint8Array(buffer);
+
+    // 读 header 到 "end_header\n"
+    let headerEndIndex = -1;
+    let headerText = "";
+    for (let i=0; i<bytes.length; i++) {
+      headerText += String.fromCharCode(bytes[i]);
+      if (headerText.includes("end_header\n")) {
+        headerEndIndex = i+1;
+        break;
+      }
+    }
+    if (headerEndIndex < 0) {
+      console.error("没找到 PLY end_header");
+      return [];
+    }
+
+    // 从 headerText 里找点的数量
+    let vertexCount = 0;
+    const lines = headerText.split(/\r?\n/);
+    for (let li=0; li<lines.length; li++) {
+      const L = lines[li].trim().toLowerCase();
+      if (L.startsWith("element vertex")) {
+        const parts = L.split(/\s+/);
+        vertexCount = parseInt(parts[2],10);
+      }
+    }
+    if (!vertexCount || vertexCount <= 0) {
+      console.error("未解析到点数量");
+      return [];
+    }
+
+    // 每个点的结构：
+    // float32 x,y,z (12字节) + uint8 r,g,b (3字节) = 15字节
+    const stride = 15;
+    const view   = new DataView(buffer, headerEndIndex);
+
+    const outPoints = new Array(vertexCount);
+    let offset = 0;
+    for (let vi=0; vi<vertexCount; vi++) {
+      const x = view.getFloat32(offset + 0,  true);
+      const y = view.getFloat32(offset + 4,  true);
+      const z = view.getFloat32(offset + 8,  true);
+      // 颜色 (offset+12, +13, +14) 我们暂时不用
+      outPoints[vi] = [x,y,z];
+      offset += stride;
+    }
+
+    return outPoints;
+  }
+
+  // ====== 渲染循环 ======
+  function animate() {
+    requestAnimationFrame(animate);
+    renderer.render(scene, camera);
+  }
+  animate();
+
+  // ====== 开始加载点云 ======
+  loadBinaryPLY("sparse.ply").then(points => {
+    showPointCloud(points);
+  });
+
+  // ====== 视口大小变化 ======
+  window.addEventListener("resize", function() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    renderer.setSize(window.innerWidth, window.innerHeight, false);
+    updateCamera();
+  });
+
+})();
+</script>
+
+</body>
+</html>
